@@ -1,0 +1,22 @@
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+Exact ag_states (0-indexed, -1=pad), used for ALL noa below:
+[[ 0 -1 -1]
+ [ 1  3 -1]
+ [ 2  4  6]
+ [ 5  7  8]]
+
+ noa     jax steady-state    optimal   efficiency
+  [noa=2 seed=0] steady-state=7.482  (89.4s, ns=10000)
+  [noa=2 seed=1] steady-state=7.477  (84.5s, ns=10000)
+  [noa=2 seed=2] steady-state=7.519  (90.7s, ns=10000)
+  [noa=2 seed=3] steady-state=7.457  (90.8s, ns=10000)
+  [noa=2 seed=4] steady-state=7.494  (87.0s, ns=10000)
+   2        7.486 +/- 0.020       7.492       99.9%
+  [noa=3 seed=0] steady-state=7.250  (5018.7s, ns=300000)
+  [noa=3 seed=1] steady-state=7.243  (2592.7s, ns=300000)
+  [noa=3 seed=2] steady-state=7.248  (2567.4s, ns=300000)
+  [noa=3 seed=3] steady-state=7.244  (2603.1s, ns=300000)
+  [noa=3 seed=4] steady-state=7.248  (2674.6s, ns=300000)
+   3        7.247 +/- 0.003       7.261       99.8%
+Do 30 Jul 2026 21:55:16 CEST: noa=3 summary detected, terminating sweep before noa=4 starts
+Do 30 Jul 2026 21:55:18 CEST: sweep terminated
