@@ -73,6 +73,8 @@ class CentralizedConfig(NamedTuple):
     end_learn: float  # fraction of ns; MATLAB default 0.850 (distinct from decentralized's 0.80)
     policy: str = "ep-greedy"
     tau: float = 0.005  # only read by stochastic-ucb/stochastic-epsilon/stochastic
+    use_double_q: bool = False  # esaic/certification.py: van Hasselt double Q-learning,
+    # additive/opt-in -- False reproduces the original single-Q path exactly (see train()).
 
 
 def _epsilon(episode, ns, end_learn):
@@ -184,19 +186,72 @@ def update(qp_table, main_ps0, main_last_ps0, main_pa0, temp_rew):
     return qp_table.at[main_last_ps0, main_pa0].set(new_val)
 
 
-def train(cfg: CentralizedConfig, rng: jax.Array):
+def _double_update_one(q_update, q_other, main_ps0, main_last_ps0, main_pa0, temp_rew):
+    old = q_update[main_last_ps0, main_pa0]
+    a_star = jnp.argmax(q_update[main_ps0])
+    bootstrapped_target = GAMMA * q_other[main_ps0, a_star]
+    target = jnp.where(temp_rew == 0.0, bootstrapped_target, temp_rew)
+    new_val = old + ALPHA * (target - old)
+    return q_update.at[main_last_ps0, main_pa0].set(new_val)
+
+
+@jax.jit
+def double_update(Q_A, Q_B, main_ps0, main_last_ps0, main_pa0, temp_rew, rng):
+    """esaic/certification.py: standard tabular Double Q-learning (van Hasselt
+    2010, Algorithm 1; van Hasselt, Guez & Silver 2016). Each call, with
+    probability 0.5, update ONE of the two tables: the table being updated
+    supplies the greedy action (argmax) at the new state, but the OTHER
+    table supplies that action's bootstrapped value. Decoupling action
+    selection from value evaluation this way removes the single-Q update's
+    systematic overestimation bias. Branches on a PRNG bit via jax.lax.cond
+    (not Python `if`) so this stays jit-compatible.
+    """
+    update_a = jax.random.bernoulli(rng)
+
+    def branch_a(qa, qb):
+        return _double_update_one(qa, qb, main_ps0, main_last_ps0, main_pa0, temp_rew), qb
+
+    def branch_b(qa, qb):
+        return qa, _double_update_one(qb, qa, main_ps0, main_last_ps0, main_pa0, temp_rew)
+
+    return jax.lax.cond(update_a, branch_a, branch_b, Q_A, Q_B)
+
+
+def train(
+    cfg: CentralizedConfig,
+    rng: jax.Array,
+    focus_states: jnp.ndarray | None = None,
+    focus_frac: float = 0.0,
+):
     """Runs the full centralized-training driver (benchmark_perfectcom_MultiAgent.m,
     at noa=2, a single run -- PORT_NOTES.md SS4.4). Returns (qp_table,
     N_table_emerged, rew): the first two shape ((n^2)^2, 5^2); rew is
     shape (cfg.ns,), the per-episode reported reward (PORT_NOTES.md
     SS11.3), matching the reference script's own rew(i) tracking.
+
+    esaic/certification.py additions, both additive/opt-in, default OFF:
+      - cfg.use_double_q=True: maintains two Q-tables (double_update()
+        above) instead of one; returns 0.5*(Q_A+Q_B) as qp_table.
+      - focus_states/focus_frac: when focus_states is not None, agent
+        index 1's (the same index clustering.value_of_observation()
+        computes V_o for) episode-start position is drawn from
+        focus_states with probability focus_frac, else from the natural
+        distribution as usual; agent 0 always draws naturally. This is
+        the refinement loop's "oversample near-boundary observations"
+        hook. Both default to a no-op that reproduces the pre-existing
+        code path byte-for-byte (verified: no extra PRNG draw happens
+        when focus_states is None, so the RNG stream is unperturbed).
     """
     n2 = cfg.n * cfg.n
     n_states = n2**NOA
     n_actions = 5**NOA
     goal_set0 = cfg.goal_set0
 
-    qp_table = jnp.full((n_states, n_actions), 0.02)
+    if cfg.use_double_q:
+        Q_A = jnp.full((n_states, n_actions), 0.02)
+        Q_B = jnp.full((n_states, n_actions), 0.02)
+    else:
+        qp_table = jnp.full((n_states, n_actions), 0.02)
     N_table = jnp.full((n_states, n_actions), 0.001)
     N_table_emerged = jnp.full((n_states, n_actions), 0.001)
 
@@ -216,8 +271,21 @@ def train(cfg: CentralizedConfig, rng: jax.Array):
 
         # ps_ind=randi(n^2-1,noa,1); ps(kk)=s_space(ps_ind(kk))  -- i.i.d. draws
         # WITH replacement from the non-goal cells, independently per agent.
-        idx = jax.random.randint(k_init_pos, (NOA,), 0, n_legit)
-        ps0 = legit0[idx]
+        if focus_states is None:
+            idx = jax.random.randint(k_init_pos, (NOA,), 0, n_legit)
+            ps0 = legit0[idx]
+        else:
+            # Agent 0 always natural; agent 1 (clustering.value_of_observation's
+            # marginalized index) mixes in focus_states with prob focus_frac.
+            # Only entered when focus_states is set, so the branch above is
+            # byte-for-byte unperturbed when this feature is unused.
+            k_a0, k_a1_nat, k_a1_focus, k_a1_gate = jax.random.split(k_init_pos, 4)
+            agent0_pos = legit0[jax.random.randint(k_a0, (), 0, n_legit)]
+            natural_agent1 = legit0[jax.random.randint(k_a1_nat, (), 0, n_legit)]
+            focus_agent1 = focus_states[jax.random.randint(k_a1_focus, (), 0, focus_states.shape[0])]
+            use_focus = jax.random.uniform(k_a1_gate) < focus_frac
+            agent1_pos = jnp.where(use_focus, focus_agent1, natural_agent1)
+            ps0 = jnp.stack([agent0_pos, agent1_pos])
         main_ps0 = flatten_mixed_radix(ps0, base=n2)
         # main_pa=randi(5^noa) initial draw is immediately overwritten inside
         # the loop before use -- wasted entropy, matching MATLAB (not ported,
@@ -232,14 +300,20 @@ def train(cfg: CentralizedConfig, rng: jax.Array):
 
         while True:
             if step_in_episode != 1:
-                qp_table = update(qp_table, main_ps0, last_main_ps0, last_main_pa0, temp_rew)
+                if cfg.use_double_q:
+                    rng, k_dq = jax.random.split(rng)
+                    Q_A, Q_B = double_update(
+                        Q_A, Q_B, main_ps0, last_main_ps0, last_main_pa0, temp_rew, k_dq
+                    )
+                else:
+                    qp_table = update(qp_table, main_ps0, last_main_ps0, last_main_pa0, temp_rew)
 
             total_steps += 1
             ucb_counter = float(total_steps)
             rng, k_act = jax.random.split(rng)
             main_pa0 = select_action(
                 main_ps0,
-                qp_table,
+                0.5 * (Q_A + Q_B) if cfg.use_double_q else qp_table,
                 N_table,
                 policy=cfg.policy,
                 episode=episode,
@@ -278,7 +352,13 @@ def train(cfg: CentralizedConfig, rng: jax.Array):
 
             if int(ter) >= 1:
                 if episode < cfg.end_learn * cfg.ns:
-                    qp_table = update(qp_table, main_ps0, last_main_ps0, last_main_pa0, temp_rew)
+                    if cfg.use_double_q:
+                        rng, k_dq = jax.random.split(rng)
+                        Q_A, Q_B = double_update(
+                            Q_A, Q_B, main_ps0, last_main_ps0, last_main_pa0, temp_rew, k_dq
+                        )
+                    else:
+                        qp_table = update(qp_table, main_ps0, last_main_ps0, last_main_pa0, temp_rew)
                 break
 
         # Episode summary reward (benchmark_perfectcom_MultiAgent.m: "if
@@ -291,4 +371,6 @@ def train(cfg: CentralizedConfig, rng: jax.Array):
             ep_rew = 1.0 * (GAMMA ** (step_in_episode - 1))
         rew = rew.at[episode].set(ep_rew)
 
+    if cfg.use_double_q:
+        qp_table = 0.5 * (Q_A + Q_B)
     return qp_table, N_table_emerged, rew

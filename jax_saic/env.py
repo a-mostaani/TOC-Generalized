@@ -84,3 +84,40 @@ def at_goal(ps0: jnp.ndarray, goal_set0: jnp.ndarray) -> jnp.ndarray:
     consistently everywhere goal_set is compared against, not just here.
     """
     return jnp.isin(ps0, goal_set0)
+
+
+def legit_states(n: int, goal_set0: jnp.ndarray) -> jnp.ndarray:
+    """Non-goal cell list, precomputed once per (n, goal_set0) -- same
+    Python-level construction centralized.py/train.py already do inline
+    before their episode loops (goal_set0 is static per training run, so
+    this is deliberately not jitted). Returns (n^2 - |goal_set0|,) int32.
+    """
+    n2 = n * n
+    goal_set_py = set(int(g) for g in goal_set0.tolist())
+    return jnp.array([s for s in range(n2) if s not in goal_set_py], dtype=jnp.int32)
+
+
+@partial(jax.jit, static_argnames=("noa",))
+def reset(rng: jax.Array, legit0: jnp.ndarray, noa: int) -> jnp.ndarray:
+    """Generic episode init, factored out of centralized.py/train.py's
+    existing inline logic (not wired into either -- purely additive, for
+    esaic/certification.py's use): i.i.d. uniform draw over legit0, with
+    replacement, independently per agent. Returns ps0: (noa,) int32.
+    """
+    n_legit = legit0.shape[0]
+    idx = jax.random.randint(rng, (noa,), 0, n_legit)
+    return legit0[idx]
+
+
+@partial(jax.jit, static_argnames=("noa", "agent_idx"))
+def reset_to(rng: jax.Array, legit0: jnp.ndarray, noa: int, agent_idx: int, o: jnp.ndarray) -> jnp.ndarray:
+    """Like reset(), but agent `agent_idx` is pinned to observation `o`
+    instead of drawn randomly -- every other agent still draws from the
+    natural distribution. This is the "start an episode at observation o,
+    marginalize over the other agent" convention already used by
+    clustering.value_of_observation()/exact_value_of_observation.py,
+    applied to a live rollout instead of exact enumeration. Used by
+    esaic/certification.py's bracket-certificate MC rollouts.
+    """
+    ps0 = reset(rng, legit0, noa)
+    return ps0.at[agent_idx].set(o)

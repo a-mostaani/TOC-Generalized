@@ -235,6 +235,7 @@ def cluster_states(
     method: str = "kmedian",
     rng: np.random.Generator | None = None,
     return_diagnostics: bool = False,
+    return_medoids: bool = False,
 ):
     """Port of aggregate_states_SAIC.m (PORT_NOTES.md SS4.3).
 
@@ -261,6 +262,16 @@ def cluster_states(
     of raw states where the legacy index would have been <=0) and
     'misassigned_states' (states whose legacy label differs from the
     nearest-medoid-to-value label) -- both empty for method != "legacy_minus50".
+
+    If return_medoids: also returns `mu`, the k medoid VALUES used to
+    assign cluster_id (the same array `ag_states`' cluster indices are
+    computed against) -- previously computed internally but discarded.
+    Added for esaic/certification.py's margins(), additive/opt-in, no
+    effect on any existing caller.
+
+    Return shape depends on which flags are set (both default False):
+    neither -> ag_states; diagnostics only -> (ag_states, diagnostics);
+    medoids only -> (ag_states, medoids); both -> (ag_states, diagnostics, medoids).
     """
     k = 2**inf_bits
     diagnostics = {"crashed_states": [], "misassigned_states": []}
@@ -295,6 +306,10 @@ def cluster_states(
         ag_states[cid, fill[cid]] = state
         fill[cid] += 1
 
+    if return_diagnostics and return_medoids:
+        return ag_states, diagnostics, medoids
     if return_diagnostics:
         return ag_states, diagnostics
+    if return_medoids:
+        return ag_states, medoids
     return ag_states
