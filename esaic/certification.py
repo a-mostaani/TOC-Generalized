@@ -93,14 +93,60 @@ class CertificationConfig(NamedTuple):
     margin_inflation: float = 1.0
     refine_max_rounds: int = 3
     refine_oversample_frac: float = 0.5
+    refine_focus_low_visit_frac: float = 0.5
+    # Fraction of F (the uncertified set), by COUNT, kept as focus_states --
+    # restricted to F's lowest-N_o member first. Found directly to matter:
+    # when most of Omega is uncertified (as it stays for the whole run in a
+    # tight-margin/large-U case), F is essentially IDENTICAL to the natural
+    # reset distribution (every non-terminal state), so "oversample toward
+    # F" was statistically indistinguishable from ordinary training --
+    # confirmed by checking F against env.reset's own legal-state set in a
+    # real run: they matched exactly, every round. That made the whole
+    # refinement mechanism a no-op specifically for the worst-covered
+    # (least-visited, worst-value-error) states it was meant to help.
+    # Narrowing focus_states to F's least-visited fraction restores genuine
+    # concentration regardless of how large F is. 1.0 reproduces the old
+    # "focus on all of F" behavior exactly (only a real restriction when
+    # < 1.0); 0.5 (default) targets the half of F needing it most.
     refine_steps: Optional[int] = None
     sampling_budget: Optional[int] = None
     uncertified_policy: str = "flag"  # "flag" | "conservative" | "weighted"
+
+    # --- APPEND NEW FIELDS ONLY BELOW THIS LINE, NEVER INSERT ABOVE IT ---
+    # This is a NamedTuple: pickle restores instances POSITIONALLY against
+    # whatever the CURRENT class definition is, not the one that existed
+    # when the pickle was written. Verified directly: inserting a field in
+    # the MIDDLE silently shifts every later field's value into the wrong
+    # NAME on unpickle (e.g. an old `cert_mode="concentration"` value
+    # silently reappearing under a newly-inserted field's name, with
+    # `cert_mode` itself quietly reverting to ITS class default) --
+    # appending at the end does not have this problem (old pickles just get
+    # the new field's default; every existing field's value is unaffected).
+    # v_hat_weighting was originally inserted right after cert_enabled and
+    # got hit by exactly this bug (silently misread as cert_mode's value in
+    # every pickle saved between that insertion and this fix, including
+    # centralized_workspace_4x4_1bit{_seed0,_seed1,_seed2}_1000k.pkl and the
+    # untagged one) -- moved here, at the true end, specifically so those
+    # already-saved pickles unpickle correctly again under the current
+    # class (confirmed: append-only never corrupts prior instances).
+    v_hat_weighting: str = "visitation"  # "visitation" | "uniform"
+    # How V_hat(o) marginalizes over the partner's position. "visitation"
+    # (default, backward compatible) = the empirical, per-self-state
+    # conditional P(partner|self=o) actually observed during training
+    # (_marginalize_joint_q's original design, PORT_NOTES.md S0 item 6).
+    # "uniform" = a single fixed distribution, uniform over non-terminal
+    # states, matching env.reset's own natural distribution regardless of
+    # o -- requested directly after the empirical weighting was found to
+    # break geometric symmetries V_hat "should" respect (e.g. two
+    # diagonal-reflection-symmetric grid cells getting different V_hat,
+    # traced to this weighting choice specifically, not to residual
+    # Q-learning error -- see CERTIFICATION.md and uniform_partner_weight()).
 
 
 CERT_MODES = ("bracket", "concentration")
 SIGMA_SOURCES = ("ensemble", "count")
 UNCERTIFIED_POLICIES = ("flag", "conservative", "weighted")
+V_HAT_WEIGHTINGS = ("visitation", "uniform")
 
 
 def margins(V_hat: jax.Array, mu: jax.Array) -> jax.Array:
@@ -119,8 +165,32 @@ def margins(V_hat: jax.Array, mu: jax.Array) -> jax.Array:
     return 0.5 * (d_sorted[:, 1] - d_sorted[:, 0])
 
 
+def uniform_partner_weight(n_obs: int, terminal_mask: Optional[jax.Array] = None) -> jax.Array:
+    """Uniform distribution over non-terminal observations -- the actual
+    natural episode-reset distribution (env.reset draws i.i.d. uniformly
+    over legal/non-terminal states), as an alternative to
+    _marginalize_joint_q's DEFAULT empirical, visitation-based
+    P(partner|self). Same weight for every self-state o (not one
+    distribution per o like the empirical version), so it also restores
+    the environment's own geometric symmetries in V_hat (e.g. two
+    diagonal-reflection-symmetric observations get IDENTICAL V_hat under
+    this weighting, given the same Q-table -- verified directly: exact
+    value iteration's V_o under this exact weighting scheme is equal to
+    6 decimal places for such a pair; it is NOT generally equal under the
+    empirical/visitation weighting, since that depends on one particular
+    training run's own asymmetric visitation history, not the problem's
+    geometry). Terminal observations get weight 0 (env.reset never starts
+    an agent there); n_obs, not grid-specific, per G1.
+    """
+    if terminal_mask is None:
+        return jnp.full((n_obs,), 1.0 / n_obs)
+    non_terminal = ~terminal_mask
+    return jnp.where(non_terminal, 1.0 / jnp.sum(non_terminal), 0.0)
+
+
 def _marginalize_joint_q(
-    q_joint: jax.Array, N_joint: jax.Array, n_obs: int, n_actions: int
+    q_joint: jax.Array, N_joint: jax.Array, n_obs: int, n_actions: int,
+    partner_weight: Optional[jax.Array] = None,
 ) -> jax.Array:
     """Marginalize a joint (NOA=2) Q-table [n_obs^2, n_actions^2] down to
     agent _AGENT_IDX's own (o, a) slice, shape [n_obs, n_actions].
@@ -132,18 +202,23 @@ def _marginalize_joint_q(
     across the WHOLE joint table) does not sum to 1 over the partner's
     position for a fixed observation o -- it's explicitly flagged in
     PORT_NOTES.md SS4.2/SS11.5 as "sum_q_MultiAgent.m's approximation,
-    verbatim", not a real conditional probability. Reusing it here made
-    V_hat systematically NOT equal to the greedy policy's actual expected
-    value, which broke the bracket certificate's soundness claim (V_hat
-    must sit between an honest lower bound V_pi_lower and upper bound
-    Q_ub for "brackets V*" to mean anything) -- V_pi_lower(o) came out
-    larger than V_hat(o) essentially always. Fixed here to a PROPERLY
-    normalized empirical conditional distribution instead: P(partner state
-    = j | self state = i) = N_state(j,i) / sum_j' N_state(j',i), a genuine
-    probability distribution over the partner's position for each o. Still
-    fully generic (n_obs/n_actions only, no task-specific content) -- see
-    CERTIFICATION.md for why this deviates from S0's original design note
-    to reuse value_of_observation's exact weighting.
+    verbatim", not a real conditional probability. Fixed here to a PROPERLY
+    normalized empirical conditional distribution instead (the DEFAULT,
+    partner_weight=None): P(partner state = j | self state = i) =
+    N_state(j,i) / sum_j' N_state(j',i), a genuine probability distribution
+    over the partner's position for each o. Still fully generic (n_obs/
+    n_actions only, no task-specific content) -- see CERTIFICATION.md for
+    why this deviates from S0's original design note to reuse
+    value_of_observation's exact weighting.
+
+    partner_weight: optional [n_obs] distribution over the partner's
+    position, used INSTEAD of the empirical per-self-state conditional
+    above when given (SAME distribution for every self-state o, unlike the
+    empirical default) -- e.g. uniform_partner_weight() above, requested
+    directly after the empirical weighting was found to break geometric
+    symmetries V_hat "should" have (diagonal-reflection-symmetric grid
+    cells getting different V_hat, traced to this weighting choice, not to
+    Q-learning imprecision -- see CERTIFICATION.md).
 
     Array sizes here (n_obs^2, n_actions^2) match jax_saic.centralized.
     train()'s own qp_table/N_table shape exactly -- fixed by NOA=2, not
@@ -153,15 +228,18 @@ def _marginalize_joint_q(
     main_state_grid = agent0_state + n_obs * agent1_state  # [n_obs, n_obs], agent-0-fastest
 
     q_full = q_joint[main_state_grid]  # [n_obs(a0), n_obs(a1), n_actions^2]
-    N_full = N_joint[main_state_grid]
 
     agent0_act, agent1_act = jnp.meshgrid(jnp.arange(n_actions), jnp.arange(n_actions), indexing="ij")
     main_action_grid = agent0_act + n_actions * agent1_act  # [n_actions, n_actions]
 
     q_reshaped = q_full[:, :, main_action_grid]  # [n_obs(a0), n_obs(a1), n_actions(a0), n_actions(a1)]
 
-    N_state = jnp.sum(N_full, axis=-1)  # [n_obs(a0), n_obs(a1)] -- total visits to this joint STATE
-    prob_table = N_state / jnp.sum(N_state, axis=0, keepdims=True)  # normalized PER agent1-state (sums to 1 over axis 0)
+    if partner_weight is None:
+        N_full = N_joint[main_state_grid]
+        N_state = jnp.sum(N_full, axis=-1)  # [n_obs(a0), n_obs(a1)] -- total visits to this joint STATE
+        prob_table = N_state / jnp.sum(N_state, axis=0, keepdims=True)  # normalized PER agent1-state (sums to 1 over axis 0)
+    else:
+        prob_table = jnp.broadcast_to(partner_weight[:, None], (n_obs, n_obs))  # same weight for every self-state
 
     partner_max_q = jnp.max(q_reshaped, axis=2)  # max over agent0's action -> [n_obs(a0), n_obs(a1), n_actions(a1)]
     weighted = partner_max_q * prob_table[:, :, None]
@@ -321,15 +399,24 @@ def marginalize_joint_n(N_joint: jax.Array, n_obs: int) -> jax.Array:
     return jnp.sum(N_full, axis=(0, -1))
 
 
-def marginalize_joint_v(q_joint: jax.Array, N_joint: jax.Array, n_obs: int, n_actions: int) -> jax.Array:
+def marginalize_joint_v(
+    q_joint: jax.Array, N_joint: jax.Array, n_obs: int, n_actions: int,
+    partner_weight: Optional[jax.Array] = None,
+) -> jax.Array:
     """V_hat(o) = max_a of _marginalize_joint_q -- the certification
     module's own generic replacement for
     jax_saic.clustering.value_of_observation(), which isn't reusable here:
     it takes a grid side-length `n` and internally assumes n_obs == n*n,
     a hidden grid-specific assumption (G1). This version is parameterized
     directly by n_obs/n_actions. Shape [n_obs].
+
+    partner_weight: forwarded to _marginalize_joint_q -- None (default)
+    keeps the empirical, visitation-based per-self-state conditional;
+    pass uniform_partner_weight(n_obs, env.terminal_mask) for a fixed,
+    self-state-independent weighting instead (see that function and
+    CertificationConfig.v_hat_weighting).
     """
-    return jnp.max(_marginalize_joint_q(q_joint, N_joint, n_obs, n_actions), axis=-1)
+    return jnp.max(_marginalize_joint_q(q_joint, N_joint, n_obs, n_actions, partner_weight=partner_weight), axis=-1)
 
 
 def concentration_sigma_ensemble(rng, env: EnvSpec, gc_config, ensemble_size: int):
@@ -512,6 +599,54 @@ def _apply_uncertified_policy(V_hat, mu, cluster_id, ag_states, certified, U, co
     raise ValueError(f"Unknown uncertified_policy {config.uncertified_policy!r}; expected one of {UNCERTIFIED_POLICIES}")
 
 
+def _cluster(V_hat: jax.Array, N_o: jax.Array, inf_bits: int, cluster_method: str, terminal_mask: Optional[jax.Array]):
+    """cluster_states(), optionally excluding terminal_mask==True
+    observations from the k-median OPTIMIZATION itself -- their value
+    estimate, however imprecise, shouldn't distort where boundaries fall
+    for observations that actually need a codeword (see
+    EnvSpec.terminal_mask's docstring: no control decision is ever made
+    conditioned on a terminal observation). Terminal observations still
+    get a valid slot in the returned ag_states/cluster_id, assigned
+    post-hoc to their nearest medoid by value (not part of the k-median
+    objective) -- downstream code (jax_saic.train.s_aggregate) needs
+    every observation covered by SOME cluster.
+    """
+    V_hat_np = np.asarray(V_hat)
+    N_o_np = np.asarray(N_o)
+
+    if terminal_mask is None:
+        ag_states, mu_np = cluster_states(V_hat_np, N_o_np, inf_bits, method=cluster_method, return_medoids=True)
+    else:
+        non_terminal_idx = np.where(~np.asarray(terminal_mask))[0]
+        _discard, mu_np = cluster_states(
+            V_hat_np[non_terminal_idx], N_o_np[non_terminal_idx], inf_bits,
+            method=cluster_method, return_medoids=True,
+        )
+
+    mu = jnp.asarray(mu_np)
+    cluster_id = jnp.argmin(jnp.abs(V_hat[:, None] - mu[None, :]), axis=1)  # nearest medoid for EVERY
+    # observation, including terminal ones when excluded above -- this is
+    # what makes their assignment "post-hoc": not part of the k-median cost.
+    if terminal_mask is not None:
+        ag_states = _ag_states_from_cluster_id(np.asarray(cluster_id), 2**inf_bits)
+    return ag_states, mu, cluster_id
+
+
+def _certify_round(rng, env, gc_config, config, qp_table, N_table_emerged, V_hat, mu, N_o, delta_medoid, rmax, gamma):
+    """One certificate + gate pass, with terminal observations (if
+    env.terminal_mask is set) forced certified=True -- there's nothing to
+    certify for them (no decision is ever made conditioned on them), and
+    leaving them uncertified would waste refinement budget chasing a
+    precision improvement that can never matter.
+    """
+    U = _compute_certificate(rng, env, gc_config, config, qp_table, N_table_emerged, N_o, rmax, gamma)
+    certified, m_eff = certify(V_hat, mu, U, delta_medoid, config)
+    if env.terminal_mask is not None:
+        certified = certified | env.terminal_mask
+    F = jnp.where(~certified)[0]
+    return U, certified, m_eff, F
+
+
 class CertificationResult(NamedTuple):
     """Spec S3 step 5's emitted result. ag_states is
     jax_saic.clustering.cluster_states()'s own padded format, ready to feed
@@ -544,7 +679,8 @@ def run_esaic_certified(
     train_fn=None,
 ) -> CertificationResult:
     """Orchestration (spec S3): initial centralized train -> cluster ->
-    certify -> loop, oversampling the uncertified set F via focus-biased
+    certify -> loop, oversampling F's lowest-visitation fraction (see
+    CertificationConfig.refine_focus_low_visit_frac) via focus-biased
     retraining (train_fn's focus_states/focus_frac hook), re-cluster,
     re-certify, until F is empty, config.sampling_budget is exhausted (in
     real extra env-step units, tracked via train_fn's returned step count),
@@ -556,14 +692,28 @@ def run_esaic_certified(
     trainer that's actually generic over EnvSpec (see that module's
     docstring for why jax_saic.centralized.train can't be reused here).
     A different train_fn with the same signature
-    (gc_config, env, rng, focus_states=None, focus_frac=0.0) ->
+    (gc_config, env, rng, focus_states=None, focus_frac=0.0,
+    init_qp_table=None, init_N_table_emerged=None) ->
     (qp_table, N_table_emerged, steps) may be substituted by a caller that
-    specifically wants a different trainer.
+    specifically wants a different trainer. Refinement rounds pass the
+    previous round's (qp_table, N_table_emerged) forward as
+    init_qp_table/init_N_table_emerged so each round continues training
+    instead of restarting from scratch -- found directly to matter: without
+    this, each round's "refined" table was a from-scratch run of only
+    refine_steps episodes, discarding the (typically much larger) prior
+    training rather than building on it, which made certification
+    unreachable through refinement regardless of how many rounds ran.
     """
     if train_fn is None:
         from esaic import generic_centralized
 
         train_fn = generic_centralized.train
+
+    if config.v_hat_weighting not in V_HAT_WEIGHTINGS:
+        raise ValueError(f"Unknown v_hat_weighting {config.v_hat_weighting!r}; expected one of {V_HAT_WEIGHTINGS}")
+    partner_weight = (
+        uniform_partner_weight(env.n_obs, env.terminal_mask) if config.v_hat_weighting == "uniform" else None
+    )
 
     rng, k_train = jax.random.split(rng)
     qp_table, N_table_emerged, _initial_steps = train_fn(gc_config, env, k_train)
@@ -572,14 +722,10 @@ def run_esaic_certified(
     # cost every certification pass pays regardless of refinement.
     total_extra_steps = 0
 
-    V_hat = marginalize_joint_v(qp_table, N_table_emerged, env.n_obs, env.n_actions)
+    V_hat = marginalize_joint_v(qp_table, N_table_emerged, env.n_obs, env.n_actions, partner_weight=partner_weight)
     N_o = marginalize_joint_n(N_table_emerged, env.n_obs)
 
-    ag_states, mu_np = cluster_states(
-        np.asarray(V_hat), np.asarray(N_o), inf_bits, method=cluster_method, return_medoids=True
-    )
-    mu = jnp.asarray(mu_np)
-    cluster_id = jnp.argmin(jnp.abs(V_hat[:, None] - mu[None, :]), axis=1)
+    ag_states, mu, cluster_id = _cluster(V_hat, N_o, inf_bits, cluster_method, env.terminal_mask)
 
     delta_medoid = jnp.array(0.0)
     round_stats = []
@@ -591,15 +737,19 @@ def run_esaic_certified(
 
     for round_idx in range(config.refine_max_rounds):
         rng, k_cert = jax.random.split(rng)
-        U = _compute_certificate(k_cert, env, gc_config, config, qp_table, N_table_emerged, N_o, rmax, gamma)
-        certified, m_eff = certify(V_hat, mu, U, delta_medoid, config)
-        F = jnp.where(~certified)[0]
+        U, certified, m_eff, F = _certify_round(
+            k_cert, env, gc_config, config, qp_table, N_table_emerged, V_hat, mu, N_o, delta_medoid, rmax, gamma
+        )
 
         round_stats.append(
             {
                 "round": round_idx,
                 "frac_certified": float(jnp.mean(certified)),
                 "n_uncertified": int(F.shape[0]),
+                "certified": np.asarray(certified),  # per-state boolean, this round -- added
+                # so callers can see WHICH states (de)certify round to round, not just the
+                # aggregate frac_certified/n_uncertified (diagnostic only, no algorithmic effect).
+                "F": np.asarray(F),  # per-round uncertified state indices, same reason
                 "min_m_eff": float(jnp.min(m_eff)),
                 "mean_U": float(jnp.mean(U)),
                 "median_U": float(jnp.median(U)),
@@ -612,38 +762,47 @@ def run_esaic_certified(
         if F.shape[0] == 0 or budget_exhausted:
             break
 
+        # Restrict focus_states to F's lowest-N_o fraction (see
+        # CertificationConfig.refine_focus_low_visit_frac's docstring for
+        # why: F alone degenerates to a no-op oversample when it's most of
+        # Omega). Plain numpy -- run_esaic_certified's loop is eager Python,
+        # not jitted, so F.shape[0] is already a concrete int here.
+        F_np, N_o_np = np.asarray(F), np.asarray(N_o)
+        n_focus = max(1, int(np.ceil(config.refine_focus_low_visit_frac * F_np.shape[0])))
+        focus_order = np.argsort(N_o_np[F_np])  # indices INTO F_np, ascending by visitation
+        focus_states = jnp.asarray(F_np[focus_order][:n_focus])
+
         rng, k_refine = jax.random.split(rng)
         qp_table, N_table_emerged, steps_this_round = train_fn(
             gc_config._replace(ns=refine_steps),
             env,
             k_refine,
-            focus_states=F.astype(jnp.int32),
+            focus_states=focus_states.astype(jnp.int32),
             focus_frac=config.refine_oversample_frac,
+            init_qp_table=qp_table,
+            init_N_table_emerged=N_table_emerged,
         )
         total_extra_steps += steps_this_round
 
-        V_hat = marginalize_joint_v(qp_table, N_table_emerged, env.n_obs, env.n_actions)
+        V_hat = marginalize_joint_v(qp_table, N_table_emerged, env.n_obs, env.n_actions, partner_weight=partner_weight)
         N_o = marginalize_joint_n(N_table_emerged, env.n_obs)
 
-        new_ag_states, new_mu_np = cluster_states(
-            np.asarray(V_hat), np.asarray(N_o), inf_bits, method=cluster_method, return_medoids=True
-        )
-        new_mu = jnp.asarray(new_mu_np)
+        new_ag_states, new_mu, new_cluster_id = _cluster(V_hat, N_o, inf_bits, cluster_method, env.terminal_mask)
         # medoid values aren't index-aligned across rounds (sorted-by-value,
         # not identity-tracked) -- comparing sorted arrays is the correct
         # "how far did the SET of medoids move" measure.
         delta_medoid = jnp.max(jnp.abs(jnp.sort(new_mu) - jnp.sort(mu)))
         mu = new_mu
         ag_states = new_ag_states
-        cluster_id = jnp.argmin(jnp.abs(V_hat[:, None] - mu[None, :]), axis=1)
+        cluster_id = new_cluster_id
 
     # If the loop exited via refine_max_rounds (not an empty-F/budget break),
     # `certified`/`U`/`m_eff` above are one retrain stale -- always finish
     # with one consistent final gate pass against the latest V_hat/mu.
     rng, k_final = jax.random.split(rng)
-    U = _compute_certificate(k_final, env, gc_config, config, qp_table, N_table_emerged, N_o, rmax, gamma)
-    certified, m_eff = certify(V_hat, mu, U, delta_medoid, config)
-    F = jnp.where(~certified)[0]
+    U, certified, m_eff, F = _certify_round(
+        k_final, env, gc_config, config, qp_table, N_table_emerged, V_hat, mu, N_o, delta_medoid, rmax, gamma
+    )
 
     cluster_id, ag_states = _apply_uncertified_policy(
         V_hat, mu, cluster_id, ag_states, certified, U, config, inf_bits, cluster_method

@@ -12,6 +12,30 @@ clustering step needs accuracy specifically *near cluster boundaries*, for
 every observation any decentralized policy might visit, or codewords get
 mis-assigned.
 
+## How to enable
+
+`jax_saic.train.run_phase1()` takes an optional `certification_cfg`
+(`esaic.certification.CertificationConfig`). Omitted, or passed with
+`cert_enabled=False`, reproduces the original
+`centralized.train()` + `value_of_observation()` + `cluster_states()` path
+exactly (verified byte-for-byte, `tests/test_certification.py::
+test_run_phase1_certification_toggle`). With `cert_enabled=True`, that step
+is replaced by `esaic.certification.run_esaic_certified()`, driven through
+`jax_saic.env.to_env_spec()` (the only place `jax_saic` depends on `esaic`
+— a local import inside `to_env_spec`, so plain `jax_saic` usage never
+requires `esaic` to be importable):
+
+```python
+from esaic.certification import CertificationConfig
+from jax_saic.train import run_phase1
+
+cert_cfg = CertificationConfig(cert_enabled=True, cert_mode="concentration",
+                                sigma_source="count", use_double_q=True,
+                                refine_max_rounds=3, refine_steps=1500)
+rew, ag_states, qp_decentral = run_phase1(centralized_cfg, decentralized_cfg, rng,
+                                           certification_cfg=cert_cfg)
+```
+
 ## 1. The margin gate
 
 For medoids `mu` (shape `[B]`) and a value estimate `V_hat` (shape `[|Ω|]`),
@@ -160,6 +184,38 @@ train()`) drives this — see that module's docstring for why
 rendezvous-tuned constants like a fixed 5-per-agent action count and
 `GAMMA=0.9`/`ALPHA=0.07`, none of which are safe to assume for a generic
 task).
+
+### 4.1 A second bug found by inspection: refinement wasn't actually refining
+
+Found directly from a user noticing a value estimate that made no physical
+sense (a grid cell 6 steps from the goal scoring a higher value than one 1
+step away). Root cause: `generic_centralized.train()` had no way to warm
+start — every call reinitialized `qp_table`/`N_table_emerged` from scratch
+(`0.02`/`0.001` fill). Each refinement round called it fresh with only
+`refine_steps` episodes, so each "refined" table was a from-scratch run
+*smaller* than the initial training run, not a continuation of it — the
+initial run's learning was silently discarded every round. This is why
+certification was unreachable through refinement regardless of round
+count: more rounds meant more *separate, small, independent* training
+runs, never one that actually accumulated precision. Fixed
+(`tests/test_certification.py::test_refinement_warm_starts` is a
+regression test for this specific failure mode): `train()` gained
+`init_qp_table`/`init_N_table_emerged` params (`None` by default, so this
+is fully backward compatible), and `run_esaic_certified()`'s refinement
+loop now passes each round's ending table forward as the next round's
+warm start. Re-verified on the case that surfaced it: values now decrease
+roughly monotonically with grid distance to the goal, as expected, and
+extra env-steps genuinely accumulate across rounds instead of resetting.
+
+Even with this fixed, full certification still didn't close on the 4x4/
+1-bit/`noa=2` task within 8 rounds — but for a legible reason visible in
+`round_stats`: `delta_medoid` stays large (0.1–1.3) round to round (the
+clustering is still evolving), and `margin_inflation`'s full-strength
+defensive penalty (`m_eff = margin - margin_inflation * delta_medoid`)
+zeroes out the margin before the certificate even gets compared against
+it. Whether that's the dominant blocker (vs. genuine value ties among
+symmetric grid cells) hasn't been isolated yet — a natural next diagnostic
+step, not done here.
 
 ## 5. Diagnostics (per round)
 
