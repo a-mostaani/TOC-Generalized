@@ -188,12 +188,41 @@ def uniform_partner_weight(n_obs: int, terminal_mask: Optional[jax.Array] = None
     return jnp.where(non_terminal, 1.0 / jnp.sum(non_terminal), 0.0)
 
 
+def _joint_state_value(q_joint: jax.Array, n_obs: int, n_actions: int) -> jax.Array:
+    """V*(joint state) = max over the FULL joint action (both agents'
+    actions together), matching jax_saic.clustering.value_of_observation()'s
+    v_o_mat = np.max(qp_table_full, axis=-1) exactly -- the textbook
+    "value of the fully-informed policy at this joint state", i.e. what the
+    ACTUAL centralized (noa=2, full-observability) policy this module
+    certifies actually achieves once it sees both agents' true positions.
+    Used by marginalize_joint_v (see that function's docstring for why
+    _marginalize_joint_q's own per-self-action decomposition, used for
+    bracket_q_ub, is a DIFFERENT and NOT interchangeable quantity). Shape
+    [n_obs(agent0=partner), n_obs(agent1=self)], agent-0-fastest.
+    """
+    agent0_state, agent1_state = jnp.meshgrid(jnp.arange(n_obs), jnp.arange(n_obs), indexing="ij")
+    main_state_grid = agent0_state + n_obs * agent1_state
+    q_full = q_joint[main_state_grid]  # [n_obs(a0), n_obs(a1), n_actions^2]
+    return jnp.max(q_full, axis=-1)  # [n_obs(a0), n_obs(a1)]
+
+
 def _marginalize_joint_q(
     q_joint: jax.Array, N_joint: jax.Array, n_obs: int, n_actions: int,
     partner_weight: Optional[jax.Array] = None,
 ) -> jax.Array:
     """Marginalize a joint (NOA=2) Q-table [n_obs^2, n_actions^2] down to
     agent _AGENT_IDX's own (o, a) slice, shape [n_obs, n_actions].
+
+    NOTE: marginalize_joint_v (V_hat) no longer calls this -- it computes
+    max_a1 E_partner[max_a0 Q(...)] (self's action FIXED across every
+    partner position), a different and generally SMALLER quantity than
+    the textbook "value of observation" E_partner[max_(a0,a1) Q(...)]
+    marginalize_joint_v now uses (found to matter: the two are not just
+    close, they can be exactly tied where the correct quantity isn't --
+    see marginalize_joint_v's docstring). Kept, and still exercised
+    exactly as before, only for bracket_q_ub/bracket_certificate
+    (cert_mode="bracket"), which structurally needs a per-(o,a)
+    decomposable table to attach a UCB bonus to before taking the max.
 
     NOTE, found by testing (test_bracket_ordering caught it): this does
     NOT use jax_saic.clustering.value_of_observation()'s own weighting
@@ -403,20 +432,52 @@ def marginalize_joint_v(
     q_joint: jax.Array, N_joint: jax.Array, n_obs: int, n_actions: int,
     partner_weight: Optional[jax.Array] = None,
 ) -> jax.Array:
-    """V_hat(o) = max_a of _marginalize_joint_q -- the certification
+    """V_hat(o) = E_partner[V*(joint state=(partner,o))] -- the certification
     module's own generic replacement for
     jax_saic.clustering.value_of_observation(), which isn't reusable here:
     it takes a grid side-length `n` and internally assumes n_obs == n*n,
     a hidden grid-specific assumption (G1). This version is parameterized
-    directly by n_obs/n_actions. Shape [n_obs].
+    directly by n_obs/n_actions, but is otherwise defined identically to
+    value_of_observation()'s own v_o_mat = np.max(qp_table_full, axis=-1):
+    take the value of the FULLY-informed joint policy (max over BOTH
+    agents' actions together, via _joint_state_value) at each joint state,
+    THEN average over the partner's position. Shape [n_obs].
 
-    partner_weight: forwarded to _marginalize_joint_q -- None (default)
-    keeps the empirical, visitation-based per-self-state conditional;
-    pass uniform_partner_weight(n_obs, env.terminal_mask) for a fixed,
-    self-state-independent weighting instead (see that function and
+    BUG FIX: earlier versions of this function returned
+    `max_a1 _marginalize_joint_q(...)` instead -- i.e.
+    max_a1 E_partner[max_a0 Q(partner,o;a0,a1)], which is NOT the same
+    quantity (self's action a1 held fixed across every partner position,
+    only partner's action free to vary per-partner, then max'd over a1
+    LAST). By a standard minimax inequality that quantity is <= the
+    correct E_partner[max_(a0,a1) Q(...)] computed here, and the gap is
+    not just sampling noise -- it's present even with the EXACT Q-table
+    (confirmed directly: for the 4x4/1-bit rendezvous task, states one
+    step from the goal came out tied with states two steps away under the
+    old formula, 7.8865 both; under this fix they correctly differ, 8.02
+    vs 7.89, matching normal distance-dependent Bellman intuition). Found
+    by a user directly questioning why two states at different distances
+    from the goal had equal value -- see CERTIFICATION.md. NOTE:
+    `_marginalize_joint_q`/`bracket_q_ub`/`bracket_certificate` (used only
+    by cert_mode="bracket", not exercised by any run in this project so
+    far) still use the OLD, per-self-action-fixed decomposition -- that's
+    a genuine, structurally necessary difference (bracket_q_ub needs a
+    per-(o,a) decomposable table to add a UCB bonus before maxing, which
+    a fully-joint-maxed value has no room left to attach one to), not an
+    oversight, but it does mean bracket-mode's own soundness bound
+    (test_bracket_ordering) has not been re-examined against this fix and
+    should be treated as unverified against the corrected V_hat definition
+    until it is.
+
+    partner_weight: None (default) = empirical, per-self-state visitation
+    conditional (same distribution _marginalize_joint_q's default uses,
+    via _conditional_partner_distribution); or e.g.
+    uniform_partner_weight(n_obs, env.terminal_mask) for a fixed,
+    self-state-independent weighting instead (see
     CertificationConfig.v_hat_weighting).
     """
-    return jnp.max(_marginalize_joint_q(q_joint, N_joint, n_obs, n_actions, partner_weight=partner_weight), axis=-1)
+    V_joint = _joint_state_value(q_joint, n_obs, n_actions)  # [n_obs(partner), n_obs(self)]
+    prob = _conditional_partner_distribution(N_joint, n_obs) if partner_weight is None else partner_weight[:, None]
+    return jnp.sum(V_joint * prob, axis=0)
 
 
 def concentration_sigma_ensemble(rng, env: EnvSpec, gc_config, ensemble_size: int):
