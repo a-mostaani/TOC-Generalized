@@ -121,3 +121,48 @@ def reset_to(rng: jax.Array, legit0: jnp.ndarray, noa: int, agent_idx: int, o: j
     """
     ps0 = reset(rng, legit0, noa)
     return ps0.at[agent_idx].set(o)
+
+
+def to_env_spec(n: int, goal_set0: jnp.ndarray, best_rew: float):
+    """Wraps this module's step()/reset()/reset_to() as an
+    esaic.certification.EnvSpec, for train.run_phase1()'s certification_cfg
+    path -- the only place jax_saic depends on esaic (a local import, so
+    plain jax_saic usage never requires esaic to be importable at all).
+
+    step()'s reward is 0 at every non-terminal transition and best_rew (all
+    NOA agents at goal) / 1.0 (some but not all) at the terminating step --
+    the same reward centralized.py's own per-episode summary reward
+    implicitly encodes (best_rew * gamma**T / 1.0 * gamma**T for a T-step
+    episode), just expressed per-step so a generic discounted MC rollout
+    (sum_t gamma^t * r_t) reproduces it exactly.
+    """
+    from esaic.env_spec import EnvSpec
+
+    NOA = 2  # matches centralized.NOA (ESAIC Theorem 1)
+    n2 = n * n
+    legit0 = legit_states(n, goal_set0)
+
+    def env_step(joint_obs, joint_action, rng):
+        del rng  # deterministic environment
+        next_obs, _err, ter = step(joint_obs, joint_action, n, goal_set0)
+        reward = jnp.where(ter == NOA, best_rew, jnp.where(ter >= 1, 1.0, 0.0))
+        terminal = (ter >= 1).astype(jnp.int32)
+        return next_obs, reward, terminal
+
+    def env_reset(rng):
+        return reset(rng, legit0, NOA)
+
+    def env_reset_to(rng, agent_idx, o):
+        return reset_to(rng, legit0, NOA, agent_idx, o)
+
+    # Goal cells are terminal: the per-agent action-freeze in both
+    # centralized.py ("any_at_goal") and train.py ("at_goal") forces STAY
+    # the instant an agent is there, overriding whatever the codeword/
+    # Q-table would have chosen -- so no control decision is ever actually
+    # made conditioned on this observation (PORT_NOTES.md SS5.3/SS4.1).
+    terminal_mask = jnp.isin(jnp.arange(n2), goal_set0)
+
+    return EnvSpec(
+        n_obs=n2, n_actions=5, n_agents=NOA, step=env_step, reset=env_reset, reset_to=env_reset_to,
+        terminal_mask=terminal_mask,
+    )

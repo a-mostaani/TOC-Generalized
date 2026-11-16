@@ -53,9 +53,9 @@ N_ACTIONS = 5
 
 
 def _rendezvous_env_spec():
-    from esaic_rendezvous_adapter import make_rendezvous_env_spec
+    from jax_saic.env import to_env_spec
 
-    return make_rendezvous_env_spec(N, jnp.array([GOAL_IDX]), BEST_REW)
+    return to_env_spec(N, jnp.array([GOAL_IDX]), BEST_REW)
 
 
 def _exact_v_star(N_joint):
@@ -319,6 +319,37 @@ def test_cluster_states_regression_defaults():
     assert np.array_equal(ag, ag2)
 
 
+def test_run_phase1_certification_toggle():
+    """jax_saic.train.run_phase1()'s certification_cfg toggle: omitted, or
+    cert_enabled=False, must reproduce the original
+    centralized.train()+value_of_observation()+cluster_states() path
+    exactly; cert_enabled=True must route through
+    esaic.certification.run_esaic_certified() instead and still return a
+    usable ag_states/rew pair."""
+    from jax_saic import centralized as central_mod
+    from jax_saic.train import DecentralizedConfig, run_phase1
+
+    ccfg = central_mod.CentralizedConfig(n=N, goal_set0=jnp.array([GOAL_IDX]), best_rew=BEST_REW, ns=300, end_learn=0.85)
+    dcfg = DecentralizedConfig(n=N, noa=2, inf_bits=2, goal_set0=jnp.array([GOAL_IDX]), best_rew=BEST_REW, gamma=GAMMA, ns=300, end_learn=0.80)
+    rng = jax.random.PRNGKey(1)
+
+    rew_default, ag_default, qp_default = run_phase1(ccfg, dcfg, rng)
+
+    cert_cfg_off = CertificationConfig(cert_enabled=False)
+    rew_off, ag_off, qp_off = run_phase1(ccfg, dcfg, rng, certification_cfg=cert_cfg_off)
+    assert jnp.array_equal(rew_default, rew_off)
+    assert jnp.array_equal(jnp.asarray(ag_default), jnp.asarray(ag_off))
+    assert jnp.array_equal(qp_default, qp_off)
+
+    cert_cfg_on = CertificationConfig(
+        cert_enabled=True, cert_mode="concentration", sigma_source="count",
+        use_double_q=True, refine_max_rounds=1, refine_steps=200,
+    )
+    rew_on, ag_on, qp_on = run_phase1(ccfg, dcfg, rng, certification_cfg=cert_cfg_on)
+    assert rew_on.shape == rew_default.shape
+    assert ag_on.shape[0] == 2**dcfg.inf_bits
+
+
 # ---------------------------------------------------------------------------
 # 6. Refinement monotonicity
 # ---------------------------------------------------------------------------
@@ -345,6 +376,51 @@ def test_refinement_monotonicity():
 
     for rs in result.round_stats:
         assert rs["min_m_eff"] >= 0.0
+
+
+def test_refinement_warm_starts():
+    """Regression test for a real bug found by inspection: without passing
+    init_qp_table/init_N_table_emerged forward, generic_centralized.train()
+    reinitializes from scratch every call, so each refinement round was
+    discarding all prior training rather than building on it -- each
+    "refined" table ended up LESS trained than the initial run alone
+    (only refine_steps fresh episodes, not initial_ns + accumulated
+    refine_steps). Checked directly here: total visitation (sum of N_o)
+    after two refinement rounds must exceed visitation after the initial
+    run alone -- provably false under the from-scratch-every-round bug,
+    since N_table_emerged would reset each round instead of accumulating.
+    """
+    env = _rendezvous_env_spec()
+    gc_cfg = GenericCentralizedConfig(ns=1000, end_learn=0.85, gamma=GAMMA, use_double_q=True)
+    rng = jax.random.PRNGKey(4)
+
+    qp0, N0, _steps0 = generic_train(gc_cfg, env, rng)
+    n_o_initial = float(jnp.sum(marginalize_joint_n(N0, env.n_obs)))
+
+    focus = jnp.arange(env.n_obs, dtype=jnp.int32)
+    qp1, N1, _steps1 = generic_train(
+        gc_cfg._replace(ns=300), env, jax.random.fold_in(rng, 1),
+        focus_states=focus, focus_frac=0.5, init_qp_table=qp0, init_N_table_emerged=N0,
+    )
+    n_o_round1 = float(jnp.sum(marginalize_joint_n(N1, env.n_obs)))
+    assert n_o_round1 > n_o_initial, "warm-started round did not accumulate visitation on top of the initial run"
+
+    qp2, N2, _steps2 = generic_train(
+        gc_cfg._replace(ns=300), env, jax.random.fold_in(rng, 2),
+        focus_states=focus, focus_frac=0.5, init_qp_table=qp1, init_N_table_emerged=N1,
+    )
+    n_o_round2 = float(jnp.sum(marginalize_joint_n(N2, env.n_obs)))
+    assert n_o_round2 > n_o_round1, "second warm-started round did not accumulate further"
+
+    # And the actual orchestration wires this through by default (no
+    # extra caller action needed) -- run_esaic_certified's own refinement
+    # loop must produce the same accumulating behavior.
+    cert_cfg = CertificationConfig(
+        cert_enabled=True, cert_mode="concentration", sigma_source="count",
+        use_double_q=True, refine_max_rounds=2, refine_steps=300, refine_oversample_frac=0.5,
+    )
+    result = run_esaic_certified(rng, env, gc_cfg, inf_bits=2, config=cert_cfg, rmax=BEST_REW, gamma=GAMMA)
+    assert float(jnp.sum(result.N_o)) > n_o_initial
 
 
 # ---------------------------------------------------------------------------

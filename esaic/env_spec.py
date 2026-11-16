@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import Callable, NamedTuple, Optional
 
+import jax
+
 
 class EnvSpec(NamedTuple):
     """A plain bundle of callables/sizes, no behavior of its own -- callers
@@ -29,6 +31,20 @@ class EnvSpec(NamedTuple):
         agent drawn from the natural distribution. Optional (None if
         unavailable) -- required only for cert_mode="bracket"'s
         V_pi_lower rollouts.
+    terminal_mask: optional (n_obs,) bool array, True where that raw
+        observation is terminal -- i.e. no control decision is ever made
+        conditioned on it (any action chosen from a terminal observation is
+        moot/overridden, matching how the rendezvous task forces STAY the
+        instant an agent is at goal). When provided, run_esaic_certified()
+        excludes these observations from the k-median optimization itself
+        (their value estimate, however imprecise, shouldn't distort where
+        cluster boundaries fall for observations that actually need a
+        codeword) and marks them trivially certified (nothing to certify --
+        their codeword never affects behavior). None (default) disables
+        this: every observation is clustered/certified as before. Which
+        observations are terminal is task-specific, so this is populated
+        by the environment adapter (e.g. jax_saic.env.to_env_spec), never
+        computed inside esaic/ itself (G1).
     """
 
     n_obs: int
@@ -37,3 +53,4 @@ class EnvSpec(NamedTuple):
     step: Callable
     reset: Callable
     reset_to: Optional[Callable] = None
+    terminal_mask: Optional[jax.Array] = None

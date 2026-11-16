@@ -50,13 +50,40 @@ def _epsilon(episode, ns, end_learn, epsilon_start):
     return epsilon_start * (1.0 - episode / (end_learn * ns))
 
 
+def _random_tiebreak_argmax(rng, values):
+    """argmax with ties broken uniformly at random, instead of jnp.argmax's
+    implicit "lowest index wins". Found to matter directly (not a
+    theoretical concern): every (state, joint-action) pair starts EXACTLY
+    tied at the shared 0.02 init, and jnp.argmax's tie-break systematically
+    preferred joint-action index 0 (= "both agents move RIGHT", under the
+    agent-0-fastest flattening -- indexing.py) whenever a greedy step hit
+    still-tied Q-values, i.e. constantly early in training and for
+    infrequently-updated (state, action) pairs throughout. Measured
+    consequence in a real run: the x=0 grid column (farthest from a
+    goal at x=n-1) got 5-10x fewer visits than cells near the goal, and
+    per-state value error vs. exact DP correlated -0.55 with visitation
+    count -- i.e. this tie-break bias was silently degrading value
+    estimates specifically for the states it steered exploration away
+    from, not a cosmetic-only effect.
+
+    Implementation: assign iid uniform random priority to every index
+    tied for the max, -inf to every non-tied index, and take argmax of
+    that -- standard random-tiebreak-argmax. A non-maximal value can never
+    win (its priority is -inf); ties are broken uniformly since the
+    priorities among them are iid.
+    """
+    is_max = values == jnp.max(values)
+    priority = jnp.where(is_max, jax.random.uniform(rng, values.shape), -jnp.inf)
+    return jnp.argmax(priority)
+
+
 @jax.jit
 def _select_action(qp_row, episode, ns, end_learn, epsilon_start, n_actions, rng):
     epsilon = jnp.clip(_epsilon(episode, ns, end_learn, epsilon_start), 0.0, 1.0)
-    rng_gate, rng_act = jax.random.split(rng)
+    rng_gate, rng_act, rng_tie = jax.random.split(rng, 3)
     explore = jax.random.uniform(rng_gate) < epsilon
     random_action = jax.random.randint(rng_act, (), 0, n_actions)
-    greedy_action = jnp.argmax(qp_row)
+    greedy_action = _random_tiebreak_argmax(rng_tie, qp_row)
     return jnp.where(explore, random_action, greedy_action).astype(jnp.int32)
 
 
@@ -100,28 +127,66 @@ def train(
     rng: jax.Array,
     focus_states: Optional[jnp.ndarray] = None,
     focus_frac: float = 0.0,
+    init_qp_table: Optional[jnp.ndarray] = None,
+    init_N_table_emerged: Optional[jnp.ndarray] = None,
+    track_reward: bool = False,
 ):
-    """Returns (qp_table, N_table_emerged): joint-indexed
+    """Returns (qp_table, N_table_emerged, total_steps): joint-indexed
     [n_obs**n_agents, n_actions**n_agents] arrays, matching
     jax_saic.centralized.train()'s return-shape convention (minus the
     per-episode `rew` curve, not needed by any certification caller).
+
+    track_reward: optional, default False -- return signature is UNCHANGED
+    unless this is explicitly set (every existing caller, including
+    esaic.certification.run_esaic_certified's train_fn calls, leaves it at
+    the default and is unaffected). When True, returns a 5-tuple instead:
+    (qp_table, N_table_emerged, total_steps, rew, steps_at_episode_end).
+    rew[i] is episode i's terminal reward (same convention as
+    jax_saic.centralized.train()'s own `rew` curve); steps_at_episode_end[i]
+    is this call's own total_steps counter at the moment episode i ended
+    (i.e. 1-indexed within THIS call only, not across chained calls -- a
+    caller chaining multiple train() calls, e.g. certification's refinement
+    rounds via a custom train_fn, must add its own running step offset to
+    get one continuous step axis; see validate/ for an example).
 
     focus_states/focus_frac: same "agent index 1 biased toward focus_states
     with probability focus_frac, agent 0 always natural" convention as
     jax_saic.centralized.train()'s additive hook -- see that function's
     docstring for why agent index 1 specifically (matches
     clustering.value_of_observation's marginalized index).
+
+    init_qp_table/init_N_table_emerged: optional warm start, both None by
+    default (matches the original fresh-init behavior exactly). Without
+    this, esaic.certification.run_esaic_certified()'s refinement loop was
+    calling this function fresh every round -- each "refined" table was
+    actually a from-scratch run of only `refine_steps` episodes, discarding
+    all prior training (including the much larger initial run) rather than
+    building on it, which is why certification was never actually reachable
+    through refinement (found directly: state values after several rounds
+    were LESS converged than after the initial run alone). When
+    init_qp_table is given (run_esaic_certified now always passes the
+    previous round's table forward), training continues from it instead of
+    re-initializing at 0.02 everywhere. For use_double_q=True, both Q_A and
+    Q_B are seeded from the same init_qp_table (the combined table is what
+    callers have -- Q_A/Q_B aren't separately exposed); this only reduces
+    double-Q's decorrelation benefit for the first few post-warm-start
+    updates, since which table updates each step is still an independent
+    random choice and they diverge again quickly.
     """
     n_states = env.n_obs**env.n_agents
     n_actions_joint = env.n_actions**env.n_agents
 
     if cfg.use_double_q:
-        Q_A = jnp.full((n_states, n_actions_joint), 0.02)
-        Q_B = jnp.full((n_states, n_actions_joint), 0.02)
+        Q_A = init_qp_table if init_qp_table is not None else jnp.full((n_states, n_actions_joint), 0.02)
+        Q_B = init_qp_table if init_qp_table is not None else jnp.full((n_states, n_actions_joint), 0.02)
     else:
-        qp_table = jnp.full((n_states, n_actions_joint), 0.02)
-    N_table_emerged = jnp.full((n_states, n_actions_joint), 0.001)
+        qp_table = init_qp_table if init_qp_table is not None else jnp.full((n_states, n_actions_joint), 0.02)
+    N_table_emerged = (
+        init_N_table_emerged if init_N_table_emerged is not None else jnp.full((n_states, n_actions_joint), 0.001)
+    )
     total_steps = 0
+    rew_list = [] if track_reward else None
+    steps_list = [] if track_reward else None
 
     for episode in range(cfg.ns):
         rng, k_reset, k_gate, k_focus_pick = jax.random.split(rng, 4)
@@ -184,8 +249,19 @@ def train(
                         qp_table = _q_update(
                             qp_table, main_ps0, last_main_ps0, last_main_pa0, temp_rew, cfg.gamma, cfg.alpha
                         )
+                if track_reward:
+                    rew_list.append(temp_rew)
+                    steps_list.append(total_steps)
                 break
 
     if cfg.use_double_q:
         qp_table = 0.5 * (Q_A + Q_B)
+    if track_reward:
+        return (
+            qp_table,
+            N_table_emerged,
+            total_steps,
+            jnp.asarray(rew_list),
+            jnp.asarray(steps_list, dtype=jnp.int32),
+        )
     return qp_table, N_table_emerged, total_steps

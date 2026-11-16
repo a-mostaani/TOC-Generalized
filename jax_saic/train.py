@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from jax_saic import centralized, clustering, qlearning as ql
 from jax_saic.env import STAY
 from jax_saic.env import step as env_step
+from jax_saic.env import to_env_spec
 from jax_saic.indexing import flatten_mixed_radix, unflatten_mixed_radix
 
 STUCK_LIMIT = 10  # SS5.3 step 8
@@ -203,20 +204,55 @@ def run_phase1(
     decentralized_cfg: DecentralizedConfig,
     rng: jax.Array,
     clustering_method: str = "kmedian",
+    certification_cfg=None,
 ):
     """Full Algorithm 1 pipeline (PORT_NOTES.md SS4.4): centralized training
     (always noa=2) -> value-of-observation -> clustering -> decentralized
     training at decentralized_cfg.noa (any N). Returns (rew, ag_states,
     qp_table_decentralized).
+
+    certification_cfg: optional esaic.certification.CertificationConfig.
+    None (default) or certification_cfg.cert_enabled=False reproduces the
+    original centralized.train() + value_of_observation() + cluster_states()
+    path byte-for-byte -- this branch is untouched from before certification
+    existed. When certification_cfg.cert_enabled=True, the centralized
+    training + clustering step is replaced by
+    esaic.certification.run_esaic_certified() (via esaic.generic_centralized,
+    NOT centralized.train()/clustering.value_of_observation() -- see
+    esaic/generic_centralized.py's docstring for why those aren't reusable
+    generically) driven through jax_saic.env.to_env_spec(); the decentralized
+    phase downstream is unchanged either way. See CERTIFICATION.md.
     """
     rng_central, rng_decentral = jax.random.split(rng)
 
-    qp_central, N_emerged_central, _central_rew = centralized.train(centralized_cfg, rng_central)
-    V_o, N_o = clustering.value_of_observation(qp_central, N_emerged_central, centralized_cfg.n)
-    ag_states_np = clustering.cluster_states(
-        V_o, N_o, decentralized_cfg.inf_bits, method=clustering_method
-    )
-    ag_states = jnp.asarray(ag_states_np)
+    if certification_cfg is not None and certification_cfg.cert_enabled:
+        from esaic.certification import run_esaic_certified
+        from esaic.generic_centralized import GenericCentralizedConfig
+
+        env_spec = to_env_spec(centralized_cfg.n, centralized_cfg.goal_set0, centralized_cfg.best_rew)
+        gc_cfg = GenericCentralizedConfig(
+            ns=centralized_cfg.ns,
+            end_learn=centralized_cfg.end_learn,
+            gamma=centralized.GAMMA,
+            use_double_q=certification_cfg.use_double_q,
+        )
+        result = run_esaic_certified(
+            rng_central,
+            env_spec,
+            gc_cfg,
+            decentralized_cfg.inf_bits,
+            certification_cfg,
+            rmax=centralized_cfg.best_rew,
+            gamma=centralized.GAMMA,
+        )
+        ag_states = jnp.asarray(result.ag_states)
+    else:
+        qp_central, N_emerged_central, _central_rew = centralized.train(centralized_cfg, rng_central)
+        V_o, N_o = clustering.value_of_observation(qp_central, N_emerged_central, centralized_cfg.n)
+        ag_states_np = clustering.cluster_states(
+            V_o, N_o, decentralized_cfg.inf_bits, method=clustering_method
+        )
+        ag_states = jnp.asarray(ag_states_np)
 
     rew, qp_decentral = train(decentralized_cfg, ag_states, rng_decentral)
     return rew, ag_states, qp_decentral
